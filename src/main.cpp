@@ -8,7 +8,7 @@
 #include <WebServer.h>
 #include <FS.h>
 #include <SPIFFS.h>
-#include "../group1_image_improved.h"
+#include "../current_image.h"
 // 引脚定义
 //#define TFT_CLK 14
 #define TFT_CS0 33
@@ -121,7 +121,7 @@ int drawed = 0;
 uint32_t image_len = 20480;
 
 // 文本水平翻转控制变量
-bool textFlipEnabled = true;
+bool textFlipEnabled = false;
 
 // 亮度控制变量 (默认为较低亮度)
 u16 currentBrightness = 800;
@@ -131,34 +131,17 @@ const char* wifi_ssid = "Hyperoptic Fibre 93B3";
 const char* wifi_password = "pebdriAnU3347Y";
 WebServer server(80);  // HTTP端口80
 
-// 上传图像缓冲区
-u8* uploadedImageData = nullptr;
-u16 uploadedImageWidth = 0;
-u16 uploadedImageHeight = 0;
-bool hasUploadedImage = false;
-
-// 上传的原始PNG数据
-u8* uploadedPngData = nullptr;
-size_t uploadedPngSize = 0;
-
 // 图像颜色反转开关（true = 反转）
-bool invertEnabled = true;
-
-// FS方式的BIN上传元数据
-bool hasUploadedBinFS = false;
-u16 fsBinW = 0;
-u16 fsBinH = 0;
-const char* fsBinPath = "/uploaded.bin";
+bool invertEnabled = false;
 
 // 函数声明
 void JBD_init(void);
 void drawLetter(char letter);
 void drawString(const char text[], int len);
 void setTextHorizontalFlip(bool enable);
+void packPngScaledRowsToPanel(u8 *dest, u16 destWidth, u16 destHeight, const u8 *src, u16 srcWidth, u16 srcHeight, u16 rowStart, u16 rows, bool invert);
+void refreshDisplay();
 void setBrightness(u16 brightness);
-void setBrightnessLow();
-void setBrightnessMedium();
-void setBrightnessHigh();
 void connectToWiFi();
 void setupWebServer();
 void handleRoot();
@@ -166,30 +149,12 @@ void handleBrightness();
 void handleFlip();
 void handleStatus();
 void handleGetBrightness();
+void handleGetInvertStatus();
+void handleGetFlipStatus();
 void handleGetWiFiStatus();
 void handleInvert();
 void handleDisplayPower();
-void handleUpload();
-void handleUploadPage();
-void handleUploadBin();
-void handleUploadBinPage();
-void handleDisplayImage();
-void handleUploadChunk();
-bool processUploadedPNG(uint8_t* data, size_t length);
-void displayUploadedImage();
-void createTestUploadedImage();
-void processPngToImage();
 void renderGreenCircle(u8 *dest, u16 widthPixels, u16 heightRows, u8 grayLevel);
-void packPngRowsToPanel(u8 *dest, u16 destWidth, const u8 *src, u16 srcWidth, u16 rowStart, u16 rows);
-void packPngScaledRowsToPanel(u8 *dest,
-                              u16 destWidth,
-                              u16 destHeight,
-                              const u8 *src,
-                              u16 srcWidth,
-                              u16 srcHeight,
-                              u16 rowStart,
-                              u16 rows,
-                              bool invert);
 
 // 配置引脚
 void JBD_init(void)
@@ -695,20 +660,7 @@ void setBrightness(u16 brightness) {
   Serial.println("亮度已设置并强制刷新显示");
 }
 
-// 设置低亮度 (25% - 适合室内使用)
-void setBrightnessLow() {
-  setBrightness(800);   // 更保守的低亮度值
-}
 
-// 设置中等亮度 (50% - 平衡使用)
-void setBrightnessMedium() {
-  setBrightness(1600);  // 更保守的中等亮度值
-}
-
-// 设置高亮度 (80% - 户外使用)
-void setBrightnessHigh() {
-  setBrightness(2500);  // 稍高一些的值来测试
-}
 
 // WiFi连接函数
 void connectToWiFi() {
@@ -765,32 +717,26 @@ void handleRoot() {
   html += "</div>";
   
   html += "<div class='control'><h3>💡 亮度控制</h3>";
-  html += "<div style='margin-bottom:10px;'>当前亮度: <span id='currentBrightness' style='font-weight:bold;color:#007bff;'>--</span></div>";
+  html += "<div style='margin-bottom:15px;'>当前亮度: <span id='currentBrightness' style='font-weight:bold;color:#007bff;'>--</span></div>";
   html += "<div style='display:flex;align-items:center;gap:8px;margin-bottom:10px;'>";
-  html += "<input id='brightnessInput' type='number' min='0' max='2500' step='50' placeholder='0-2500' style='width:120px;padding:6px;'>";
-  html += "<button class='btn-primary' onclick=\"setBrightnessValue()\">设置亮度</button>";
+  html += "<input id='brightnessInput' type='number' min='0' max='65535' step='1' placeholder='0-65535' style='width:150px;padding:8px;font-size:14px;'>";
+  html += "<button class='btn-primary' onclick=\"setBrightnessValue()\" style='padding:8px 15px;'>设置亮度</button>";
   html += "</div>";
-  html += "<button class='btn-primary' onclick=\"setBrightness('low')\">低亮度 (800)</button>";
-  html += "<button class='btn-success' onclick=\"setBrightness('medium')\">中亮度 (1600)</button>";
-  html += "<button class='btn-warning' onclick=\"setBrightness('high')\">高亮度 (2500)</button>";
+  html += "<div style='font-size:12px;color:#666;margin-top:5px;'>建议范围: 20-2000，最大值: 65535</div>";
   html += "</div>";
 
   // 颜色反转
   html += "<div class='control'><h3>🎨 颜色反转</h3>";
-  html += "<button class='btn-primary' onclick=\"fetch('/invert?enable=true')\">启用反转</button>";
-  html += "<button class='btn-danger' onclick=\"fetch('/invert?enable=false')\">禁用反转</button>";
-  html += "<div style='margin-top:8px'>当前: <b>";
-  html += String(invertEnabled ? "启用" : "禁用");
-  html += "</b></div>";
+  html += "<div style='margin-bottom:10px;'>当前状态: <span id='invertStatus' style='font-weight:bold;color:#007bff;'>--</span></div>";
+  html += "<button class='btn-primary' onclick=\"toggleInvert(true)\">启用反转</button>";
+  html += "<button class='btn-danger' onclick=\"toggleInvert(false)\">禁用反转</button>";
   html += "</div>";
   
   html += "<script>";
-  html += "function setBrightness(level) {";
-  html += "  fetch('/brightness?level=' + level).then(() => updateBrightness());";
-  html += "}";
   html += "function setBrightnessValue() {";
   html += "  const el=document.getElementById('brightnessInput');";
-  html += "  let v=parseInt(el.value||'0'); if(isNaN(v)) v=0; if(v<0) v=0; if(v>2500) v=2500;";
+  html += "  let v=parseInt(el.value||'0'); if(isNaN(v)) v=0; if(v<0) v=0; if(v>65535) v=65535;";
+  html += "  if(v>2000) { if(!confirm('亮度值较高 (' + v + ')，可能导致显示器过热。确定要设置吗？')) return; }";
   html += "  fetch('/brightness?value=' + v).then(() => updateBrightness());";
   html += "}";
   html += "function updateBrightness() {";
@@ -798,7 +744,25 @@ void handleRoot() {
   html += "    document.getElementById('currentBrightness').textContent = data.current + ' (reg: ' + data.register + ')';";
   html += "  });";
   html += "}";
-  html += "updateBrightness(); setInterval(updateBrightness, 2000);";
+  html += "function toggleInvert(enable) {";
+  html += "  fetch('/invert?enable=' + enable).then(() => updateInvertStatus());";
+  html += "}";
+  html += "function updateInvertStatus() {";
+  html += "  fetch('/api/invert-status').then(r => r.json()).then(data => {";
+  html += "    document.getElementById('invertStatus').textContent = data.status;";
+  html += "  });";
+  html += "}";
+  html += "function toggleFlip(enable) {";
+  html += "  fetch('/flip?enable=' + enable).then(() => updateFlipStatus());";
+  html += "}";
+  html += "function updateFlipStatus() {";
+  html += "  fetch('/api/flip-status').then(r => r.json()).then(data => {";
+  html += "    document.getElementById('flipStatus').textContent = data.status;";
+  html += "  });";
+  html += "}";
+
+  html += "updateBrightness(); updateInvertStatus(); updateFlipStatus();";
+  html += "setInterval(updateBrightness, 2000); setInterval(updateInvertStatus, 2000); setInterval(updateFlipStatus, 2000);";
   html += "function displayImage() {";
   html += "  fetch('/display-image').then(r => r.text()).then(msg => alert(msg));";
   html += "}";
@@ -811,17 +775,12 @@ void handleRoot() {
   html += "</script>";
   
   html += "<div class='control'><h3>🔄 显示翻转</h3>";
-  html += "<button class='btn-primary' onclick=\"fetch('/flip?enable=true')\">启用水平翻转</button>";
-  html += "<button class='btn-danger' onclick=\"fetch('/flip?enable=false')\">禁用水平翻转</button>";
+  html += "<div style='margin-bottom:10px;'>当前状态: <span id='flipStatus' style='font-weight:bold;color:#007bff;'>--</span></div>";
+  html += "<button class='btn-primary' onclick=\"toggleFlip(true)\">启用水平翻转</button>";
+  html += "<button class='btn-danger' onclick=\"toggleFlip(false)\">禁用水平翻转</button>";
   html += "</div>";
   
-  html += "<div class='control'><h3>🖼️ 图像上传</h3>";
-  html += "<button class='btn-primary' onclick=\"window.location.href='/upload'\">上传PNG图像</button>";
-  if (hasUploadedImage) {
-    html += "<button class='btn-success' onclick=\"displayImage()\" style='margin-left:10px;'>显示上传的图像</button>";
-  }
-  html += "<button class='btn-warning' onclick=\"window.location.href='/upload-bin'\" style='margin-left:10px;'>上传BIN(原始灰度)</button>";
-  html += "</div>";
+
 
   // 显示电源
   html += "<div class='control'><h3>🖥️ 屏幕电源</h3>";
@@ -839,33 +798,21 @@ void handleRoot() {
 }
 
 void handleBrightness() {
-  String level = server.arg("level");
   String value = server.arg("value");
-  
-  Serial.print("收到亮度调整请求: ");
-  Serial.println(level.length()? level : value);
   
   if (value.length()) {
     int v = value.toInt();
-    if (v < 0) v = 0; if (v > 2500) v = 2500;
+    if (v < 0) v = 0; 
+    if (v > 65535) v = 65535;  // 16位寄存器最大值
+    
+    Serial.print("设置自定义亮度: ");
+    Serial.println(v);
+    
     setBrightness((u16)v);
     server.send(200, "text/plain", String("亮度设置为 ") + v);
-    return;
-  } else if (level == "low") {
-    setBrightnessLow();
-    Serial.println("执行亮度调整: 低 (800)");
-    server.send(200, "text/plain", "亮度设置为低 (800)");
-  } else if (level == "medium") {
-    setBrightnessMedium();
-    Serial.println("执行亮度调整: 中 (1600)");
-    server.send(200, "text/plain", "亮度设置为中 (1600)");
-  } else if (level == "high") {
-    setBrightnessHigh();
-    Serial.println("执行亮度调整: 高 (2500)");
-    server.send(200, "text/plain", "亮度设置为高 (2500)");
   } else {
-    Serial.println("无效的亮度参数: " + level);
-    server.send(400, "text/plain", "无效的亮度参数");
+    Serial.println("缺少亮度参数");
+    server.send(400, "text/plain", "缺少亮度参数");
   }
 }
 
@@ -884,13 +831,37 @@ void handleFlip() {
 }
 
 // 颜色反转控制
+// 重新显示当前图像（用于反转、翻转等设置变更后的刷新）
+void refreshDisplay() {
+  const u16 panelWidth = 640;
+  const u16 panelHeight = 480;
+  const u16 chunkRows = 60; // 480/60=8整块，避免边界伪影
+  const u16 bytesPerRow = panelWidth / 2;
+  u16 rowStart = 0;
+  
+  while (rowStart < panelHeight) {
+    u16 rowsNow = (panelHeight - rowStart) > chunkRows ? chunkRows : (panelHeight - rowStart);
+    memset(image, 0, (size_t)bytesPerRow * (size_t)rowsNow);
+    packPngScaledRowsToPanel(image, panelWidth, panelHeight,
+                             current_image_data, current_image_width, current_image_height,
+                             rowStart, rowsNow, invertEnabled);
+    u32 lenBytes = (u32)bytesPerRow * (u32)rowsNow;
+    display_image(image, lenBytes, 0, (u16)rowStart);
+    rowStart += rowsNow;
+  }
+}
+
 void handleInvert() {
   String enable = server.arg("enable");
   if (enable == "true") {
     invertEnabled = true;
+    Serial.println("反转已启用");
+    refreshDisplay(); // 重新显示图像
     server.send(200, "text/plain", "invert on");
   } else if (enable == "false") {
     invertEnabled = false;
+    Serial.println("反转已禁用");
+    refreshDisplay(); // 重新显示图像
     server.send(200, "text/plain", "invert off");
   } else {
     server.send(400, "text/plain", "invalid param");
@@ -984,6 +955,22 @@ void handleGetBrightness() {
   server.send(200, "application/json", json);
 }
 
+void handleGetInvertStatus() {
+  String json = "{";
+  json += "\"enabled\": " + String(invertEnabled ? "true" : "false") + ",";
+  json += "\"status\": \"" + String(invertEnabled ? "启用" : "禁用") + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleGetFlipStatus() {
+  String json = "{";
+  json += "\"enabled\": " + String(textFlipEnabled ? "true" : "false") + ",";
+  json += "\"status\": \"" + String(textFlipEnabled ? "启用" : "禁用") + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
 void handleGetWiFiStatus() {
   String json = "{";
   json += "\"ssid\": \"" + String(wifi_ssid) + "\",";
@@ -996,417 +983,20 @@ void handleGetWiFiStatus() {
   server.send(200, "application/json", json);
 }
 
-void handleUploadPage() {
-  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
-  html += "<title>Upload PNG Image</title>";
-  html += "<style>body{font-family:Arial;margin:40px;background:#f0f0f0;}";
-  html += ".container{max-width:600px;margin:0 auto;background:white;padding:30px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1);}";
-  html += "h1{color:#333;text-align:center;}";
-  html += ".upload-area{border:2px dashed #007bff;border-radius:10px;padding:40px;text-align:center;margin:20px 0;}";
-  html += "input[type=file]{margin:20px 0;}";
-  html += ".btn{background:#007bff;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin:10px;}";
-  html += ".info{background:#e9f4ff;padding:15px;border-radius:5px;margin:15px 0;}";
-  html += "</style></head><body>";
-  html += "<div class='container'>";
-  html += "<h1>🖼️ PNG Image Upload</h1>";
-  
-  html += "<div class='info'>";
-  html += "<strong>支持格式:</strong> PNG图像<br>";
-  html += "<strong>建议尺寸:</strong> 640x480 或更小<br>";
-  html += "<strong>自动处理:</strong> 灰度转换、缩放、4bit量化";
-  html += "</div>";
-  
-  html += "<form method='POST' action='/upload' enctype='multipart/form-data'>";
-  html += "<div class='upload-area'>";
-  html += "<h3>📁 选择PNG文件</h3>";
-  html += "<input type='file' name='image' accept='.png' required>";
-  html += "<br><button type='submit' class='btn'>⬆️ 上传并转换</button>";
-  html += "</div></form>";
-  
-  html += "<button class='btn' onclick='window.location.href=\"/\"' style='background:#28a745;'>🏠 返回主页</button>";
-  html += "</div></body></html>";
-  
-  server.send(200, "text/html", html);
-}
 
-void handleUploadBinPage() {
-  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
-  html += "<title>Upload BIN</title>";
-  html += "<style>body{font-family:Arial;margin:40px;background:#f0f0f0;}";
-  html += ".container{max-width:600px;margin:0 auto;background:white;padding:30px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1);}";
-  html += "h1{color:#333;text-align:center;}";
-  html += ".btn{background:#007bff;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin:10px;}";
-  html += "input{padding:8px;margin:5px;width:100px;}";
-  html += "</style></head><body>";
-  html += "<div class='container'>";
-  html += "<h1>📦 Upload Raw BIN (0..15 per pixel)</h1>";
-  html += "<div class='info'>若不填写宽高，服务器将自动根据文件大小识别：";
-  html += "307200=640x480, 76800=320x240, 19200=160x120, 58752=288x204</div>";
-  html += "<form method='POST' action='/upload-bin' enctype='multipart/form-data'>";
-  html += "宽: <input type='number' name='w' placeholder='可选'> 高: <input type='number' name='h' placeholder='可选'><br>";
-  html += "<input type='file' name='file' accept='.bin' required>";
-  html += "<br><button type='submit' class='btn'>⬆️ 上传BIN</button>";
-  html += "</form>";
-  html += "<button class='btn' onclick='window.location.href=\"/\"' style='background:#28a745;'>🏠 返回主页</button>";
-  html += "</div></body></html>";
-  server.send(200, "text/html", html);
-}
 
-void handleUploadBin() {
-  HTTPUpload& upload = server.upload();
-  static File fsOut;
-  static size_t rec = 0;
-  static int w = 0, h = 0;
 
-  // (FS streaming mode; no RAM growth allocator needed)
 
-  if (upload.status == UPLOAD_FILE_START) {
-    // 可选表单字段
-    w = server.hasArg("w") ? server.arg("w").toInt() : 0;
-    h = server.hasArg("h") ? server.arg("h").toInt() : 0;
-    if (uploadedImageData) { free(uploadedImageData); uploadedImageData = nullptr; }
-    hasUploadedImage = false;
-    hasUploadedBinFS = false;
-    fsBinW = fsBinH = 0;
-    rec = 0;
-    SPIFFS.begin(true);
-    if (SPIFFS.exists(fsBinPath)) SPIFFS.remove(fsBinPath);
-    fsOut = SPIFFS.open(fsBinPath, FILE_WRITE);
-    if (!fsOut) {
-      server.send(500, "text/plain", "FS open failed");
-      return;
-    }
-    Serial.printf("BIN start w=%d h=%d (optional)\n", w, h);
-  } else if (upload.status == UPLOAD_FILE_WRITE) {
-    if (fsOut) {
-      fsOut.write(upload.buf, upload.currentSize);
-      rec += upload.currentSize;
-    }
-  } else if (upload.status == UPLOAD_FILE_END) {
-    Serial.printf("BIN end rec=%u\n", (unsigned)rec);
-    // 若未提供w/h，尝试按常用尺寸推断
-    if (w <= 0 || h <= 0) {
-      if      (rec == 640u * 480u) { w = 640; h = 480; }
-      else if (rec == 320u * 240u) { w = 320; h = 240; }
-      else if (rec == 160u * 120u) { w = 160; h = 120; }
-      else if (rec == 288u * 204u) { w = 288; h = 204; }
-    }
-    if (fsOut) fsOut.close();
-    if (w <= 0 || h <= 0 || rec != (size_t)w * (size_t)h) {
-      if (SPIFFS.exists(fsBinPath)) SPIFFS.remove(fsBinPath);
-      server.send(400, "text/plain", "Unable to infer w/h; please provide width & height");
-      return;
-    }
-    // 采用FS存储的BIN作为源，避免堆内存占用
-    fsBinW = (u16)w;
-    fsBinH = (u16)h;
-    hasUploadedBinFS = true;
-    server.send(200, "text/plain", "BIN uploaded to FS and ready");
-  } else if (upload.status == UPLOAD_FILE_ABORTED) {
-    if (fsOut) fsOut.close();
-    if (SPIFFS.exists(fsBinPath)) SPIFFS.remove(fsBinPath);
-    hasUploadedImage = false;
-  }
-}
-void handleUpload() {
-  HTTPUpload& upload = server.upload();
-  static uint8_t* tempBuffer = nullptr;
-  static size_t tempBufferSize = 0;
-  static size_t tempReceived = 0;
-  
-  if (upload.status == UPLOAD_FILE_START) {
-    Serial.printf("Upload Start: %s\n", upload.filename.c_str());
-    
-    // 清理之前的数据
-    if (uploadedImageData) {
-      free(uploadedImageData);
-      uploadedImageData = nullptr;
-    }
-    if (uploadedPngData) {
-      free(uploadedPngData);
-      uploadedPngData = nullptr;
-    }
-    if (tempBuffer) {
-      free(tempBuffer);
-      tempBuffer = nullptr;
-    }
-    
-    hasUploadedImage = false;
-    uploadedPngSize = 0;
-    tempReceived = 0;
-    
-    // 分配临时缓冲区存储PNG数据 (最大50KB)
-    tempBufferSize = 50 * 1024;
-    tempBuffer = (uint8_t*)malloc(tempBufferSize);
-    if (!tempBuffer) {
-      tempBufferSize = 20 * 1024;
-      tempBuffer = (uint8_t*)malloc(tempBufferSize);
-    }
-    
-    Serial.printf("Free heap: %u bytes, temp buffer: %u bytes\n", 
-                  ESP.getFreeHeap(), tempBufferSize);
-    
-  } else if (upload.status == UPLOAD_FILE_WRITE) {
-    // 存储PNG数据块
-    if (upload.currentSize > 0 && tempBuffer) {
-      if (tempReceived + upload.currentSize <= tempBufferSize) {
-        memcpy(tempBuffer + tempReceived, upload.buf, upload.currentSize);
-        tempReceived += upload.currentSize;
-        Serial.printf("Upload Write: %u bytes (total: %u)\n", 
-                      upload.currentSize, tempReceived);
-      } else {
-        Serial.println("Temp buffer overflow!");
-      }
-    }
-    
-  } else if (upload.status == UPLOAD_FILE_END) {
-    Serial.printf("Upload End: %u bytes received\n", tempReceived);
-    
-    if (tempReceived > 0 && tempBuffer) {
-      // 保存PNG数据
-      uploadedPngData = (uint8_t*)malloc(tempReceived);
-      if (uploadedPngData) {
-        memcpy(uploadedPngData, tempBuffer, tempReceived);
-        uploadedPngSize = tempReceived;
-        
-        // 先清理临时缓冲区，释放大块内存，避免堆碎片影响后续图像内存分配
-        if (tempBuffer) {
-          free(tempBuffer);
-          tempBuffer = nullptr;
-        }
 
-        // 处理PNG并创建图像（此时可用内存更充足）
-        Serial.println("Processing uploaded PNG...");
-        processPngToImage();
-        
-        // 验证图像状态
-        Serial.printf("After processing - hasUploadedImage: %s, data: %p\n",
-                      hasUploadedImage ? "true" : "false", uploadedImageData);
-        
-        String response = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
-        response += "<title>Upload Success</title>";
-        response += "<style>body{font-family:Arial;margin:40px;text-align:center;}";
-        response += ".success{color:#28a745;font-size:24px;margin:20px;}";
-        response += ".btn{background:#007bff;color:white;padding:10px 20px;border:none;border-radius:5px;text-decoration:none;margin:10px;}";
-        response += "</style></head><body>";
-        response += "<div class='success'>✅ 图像上传成功!</div>";
-        response += "<p>文件大小: " + String(tempReceived) + " bytes</p>";
-        response += "<p>图像已处理为适合AR眼镜的格式</p>";
-        response += "<a href='/display-image' class='btn'>🖥️ 立即显示</a>";
-        response += "<a href='/' class='btn' style='background:#28a745;'>🏠 返回主页</a>";
-        response += "</body></html>";
-        
-        server.send(200, "text/html", response);
-      } else {
-        Serial.println("Failed to save PNG data");
-        if (tempBuffer) free(tempBuffer);
-        server.send(500, "text/plain", "Failed to save uploaded data");
-      }
-    } else {
-      if (tempBuffer) free(tempBuffer);
-      server.send(400, "text/plain", "Upload failed - no data received");
-    }
-  } else if (upload.status == UPLOAD_FILE_ABORTED) {
-    Serial.println("Upload aborted");
-    if (tempBuffer) {
-      free(tempBuffer);
-      tempBuffer = nullptr;
-    }
-    hasUploadedImage = false;
-  }
-}
 
-// 创建测试上传图像（占位符函数）
-void createTestUploadedImage() {
-  Serial.printf("Creating test image... Free heap: %u bytes\n", ESP.getFreeHeap());
-  
-  // 使用更小的图像尺寸以适应内存限制
-  uploadedImageWidth = 320;
-  uploadedImageHeight = 240;
-  
-  size_t imageSize = uploadedImageWidth * uploadedImageHeight;
-  Serial.printf("Attempting to allocate %u bytes for image\n", imageSize);
-  
-  uploadedImageData = (u8*)malloc(imageSize);
-  
-  if (uploadedImageData) {
-    Serial.println("Image memory allocated successfully");
-    
-    // 创建一个简单的测试图案
-    for (u16 y = 0; y < uploadedImageHeight; y++) {
-      for (u16 x = 0; x < uploadedImageWidth; x++) {
-        u8 value;
-        // 创建一个圆形图案
-        int centerX = uploadedImageWidth / 2;
-        int centerY = uploadedImageHeight / 2;
-        int dx = x - centerX;
-        int dy = y - centerY;
-        int distance = dx * dx + dy * dy;
-        int radius = 60;
-        
-        if (distance < radius * radius) {
-          value = 15; // 圆形内部 - 亮
-        } else if ((x / 20 + y / 20) % 2 == 0) {
-          value = 8;  // 外部棋盘格 - 中等
-        } else {
-          value = 2;  // 外部棋盘格 - 暗
-        }
-        uploadedImageData[y * uploadedImageWidth + x] = value;
-      }
-    }
-    hasUploadedImage = true;
-    Serial.printf("测试图像已创建 (%ux%u) - hasUploadedImage: %s, data: %p\n", 
-                  uploadedImageWidth, uploadedImageHeight,
-                  hasUploadedImage ? "true" : "false", uploadedImageData);
-  } else {
-    Serial.println("Failed to allocate image memory! Trying even smaller size...");
-    
-    // 尝试更小的尺寸
-    uploadedImageWidth = 160;
-    uploadedImageHeight = 120;
-    imageSize = uploadedImageWidth * uploadedImageHeight;
-    
-    Serial.printf("Trying smaller allocation: %u bytes\n", imageSize);
-    uploadedImageData = (u8*)malloc(imageSize);
-    
-    if (uploadedImageData) {
-      // 创建简单的测试图案
-      for (u16 y = 0; y < uploadedImageHeight; y++) {
-        for (u16 x = 0; x < uploadedImageWidth; x++) {
-          u8 value = ((x / 10 + y / 10) % 2 == 0) ? 15 : 3;
-          uploadedImageData[y * uploadedImageWidth + x] = value;
-        }
-      }
-      hasUploadedImage = true;
-      Serial.printf("小尺寸测试图像已创建 (%ux%u)\n", uploadedImageWidth, uploadedImageHeight);
-    } else {
-      Serial.println("Failed to allocate even smaller image memory!");
-      hasUploadedImage = false;
-    }
-  }
-}
 
-// 简化的PNG处理函数
-void processPngToImage() {
-  Serial.printf("Starting PNG processing... Free heap: %u\n", ESP.getFreeHeap());
-  
-  if (!uploadedPngData || uploadedPngSize == 0) {
-    Serial.println("No PNG data - creating fallback image");
-    createTestUploadedImage();
-    return;
-  }
-  
-  Serial.printf("Processing PNG: %u bytes\n", uploadedPngSize);
-  
-  // 直接使用小尺寸，确保内存足够
-  uploadedImageWidth = 160;
-  uploadedImageHeight = 120;
-  
-  size_t imageSize = uploadedImageWidth * uploadedImageHeight;
-  Serial.printf("Allocating %u bytes for image\n", imageSize);
-  
-  uploadedImageData = (u8*)malloc(imageSize);
-  
-  if (!uploadedImageData) {
-    Serial.println("Allocation failed - trying test image");
-    createTestUploadedImage();
-    return;
-  }
-  
-  Serial.println("Creating pattern from PNG data...");
-  
-  // 使用PNG数据的简单散列创建图案
-  for (u16 y = 0; y < uploadedImageHeight; y++) {
-    for (u16 x = 0; x < uploadedImageWidth; x++) {
-      // 使用PNG数据创建独特图案
-      size_t dataIndex = ((y * uploadedImageWidth + x) * 7) % uploadedPngSize;
-      u8 pngByte = uploadedPngData[dataIndex];
-      
-      // 简单映射到4bit灰度
-      u8 value = pngByte >> 4; // 取高4位
-      if (value == 0) value = 1; // 避免全黑
-      
-      uploadedImageData[y * uploadedImageWidth + x] = value;
-    }
-  }
-  
-  hasUploadedImage = true;
-  Serial.printf("✅ PNG processed successfully (%ux%u) - hasImage: %s, data: %p\n", 
-                uploadedImageWidth, uploadedImageHeight,
-                hasUploadedImage ? "true" : "false", uploadedImageData);
-}
 
-void handleDisplayImage() {
-  Serial.printf("Display image request - hasUploadedImage: %s, uploadedImageData: %p\n", 
-                hasUploadedImage ? "true" : "false", uploadedImageData);
-  
-  if (!hasUploadedImage || !uploadedImageData) {
-    String errorMsg = "No image uploaded - hasImage: ";
-    errorMsg += hasUploadedImage ? "true" : "false";
-    errorMsg += ", data: ";
-    errorMsg += uploadedImageData ? "valid" : "null";
-    
-    server.send(400, "text/plain", errorMsg);
-    Serial.println(errorMsg);
-    return;
-  }
-  
-  Serial.println("开始显示上传的图像...");
-  displayUploadedImage();
-  
-  server.send(200, "text/plain", "Image displayed successfully!");
-}
 
-void displayUploadedImage() {
-  if (!hasUploadedImage && !hasUploadedBinFS) {
-    Serial.println("错误: 没有上传的图像数据");
-    return;
-  }
-  
-  const u16 panelWidth = 640;
-  const u16 panelHeight = 480;
-  const u16 chunkRows = 60;
-  const u16 bytesPerRow = panelWidth / 2;
-  
-  u16 rowStart = 0;
-  while (rowStart < panelHeight) {
-    u16 rowsNow = (panelHeight - rowStart) > chunkRows ? chunkRows : (panelHeight - rowStart);
-    
-    // 清空缓冲区
-    memset(image, 0, (size_t)bytesPerRow * (size_t)rowsNow);
-    
-    if (hasUploadedBinFS) {
-      // 从FS按行读取BIN并打包
-      File f = SPIFFS.open(fsBinPath, FILE_READ);
-      if (!f) { Serial.println("FS open failed"); return; }
-      // 读取对应源行范围到一个小缓冲
-      const u32 srcStride = (u32)fsBinW; // 每行字节
-      const u32 startOff = (u32)rowStart * srcStride * (u32)fsBinH / (u32)panelHeight; // 先粗略，实际pack函数会重新采样
-      // 简化：一次性读 rowsNow 对应的近似字节（足够）
-      const u32 approxRows = rowsNow * fsBinH / panelHeight + 2;
-      const u32 readBytes = approxRows * srcStride;
-      static u8 lineBuf[640*64]; // 约40KB上限
-      f.seek(startOff, SeekSet);
-      size_t got = f.read(lineBuf, readBytes > sizeof(lineBuf) ? sizeof(lineBuf) : readBytes);
-      f.close();
-      // 使用pack函数对 lineBuf 进行缩放打包（源宽=fsBinW，高度近似）
-      packPngScaledRowsToPanel(image, panelWidth, panelHeight,
-                               lineBuf, fsBinW, fsBinH,
-                               rowStart, rowsNow, invertEnabled);
-    } else {
-      // 打包内存中的图像
-      packPngScaledRowsToPanel(image, panelWidth, panelHeight, 
-                               uploadedImageData, uploadedImageWidth, uploadedImageHeight, 
-                               rowStart, rowsNow, invertEnabled);
-    }
-    
-    u32 lenBytes = (u32)bytesPerRow * (u32)rowsNow;
-    display_image(image, lenBytes, 0, (u16)rowStart);
-    rowStart += rowsNow;
-  }
-  
-  Serial.println("上传图像显示完成");
-}
+
+
+
+
+
 
 void setupWebServer() {
   server.on("/", handleRoot);
@@ -1415,13 +1005,11 @@ void setupWebServer() {
   server.on("/display-power", handleDisplayPower);
   server.on("/status", handleStatus);
   server.on("/api/brightness", handleGetBrightness);
+  server.on("/api/invert-status", handleGetInvertStatus);
+  server.on("/api/flip-status", handleGetFlipStatus);
   server.on("/invert", handleInvert);
   server.on("/api/wifi-status", handleGetWiFiStatus);
-  server.on("/upload", HTTP_GET, handleUploadPage);
-  server.on("/upload", HTTP_POST, []() { server.send(200); }, handleUpload);
-  server.on("/upload-bin", HTTP_GET, handleUploadBinPage);
-  server.on("/upload-bin", HTTP_POST, []() { server.send(200); }, handleUploadBin);
-  server.on("/display-image", handleDisplayImage);
+
   
   server.begin();
   Serial.println("Web服务器启动成功!");
@@ -1539,11 +1127,10 @@ void setup()
   panel_init();
   
   // 设置文本水平翻转 (true = 翻转, false = 正常)
-  setTextHorizontalFlip(true);
+  setTextHorizontalFlip(false);
   
-  // 设置低亮度 (启动默认)
-  setBrightnessLow(); 
-  // setBrightness(800);  
+  // 设置默认亮度
+  setBrightness(50);  // 启动时使用适中的默认亮度  
 
   // 连接WiFi并启动Web服务器
   connectToWiFi();
@@ -1561,7 +1148,7 @@ void setup()
     u16 rowsNow = (panelHeight - rowStart) > chunkRows ? chunkRows : (panelHeight - rowStart);
     memset(image, 0, (size_t)bytesPerRow * (size_t)rowsNow);
     packPngScaledRowsToPanel(image, panelWidth, panelHeight,
-                             group1_data, group1_width, group1_height,
+                             current_image_data, current_image_width, current_image_height,
                              rowStart, rowsNow, invertEnabled);
     u32 lenBytes = (u32)bytesPerRow * (u32)rowsNow;
     display_image(image, lenBytes, 0, (u16)rowStart);
