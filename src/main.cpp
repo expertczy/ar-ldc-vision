@@ -163,6 +163,10 @@ void handleInvert();
 void handleDisplayPower();
 void renderGreenCircle(u8 *dest, u16 widthPixels, u16 heightRows, u8 grayLevel);
 
+// 无文件直刷：流式上传（multipart/form-data）
+void handleStreamUpload();
+void handleStreamComplete();
+
 // 运行时上传/应用/测试/下载/FS状态
 void handleUploadData();
 void handleUploadComplete();
@@ -683,6 +687,8 @@ void setBrightness(u16 brightness) {
 void connectToWiFi() {
   Serial.println("正在连接WiFi...");
   WiFi.begin(wifi_ssid, wifi_password);
+  // 提升吞吐与稳定性
+  WiFi.setSleep(false);
   
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 30) {
@@ -1140,6 +1146,97 @@ void handleGetRuntimeStatus() {
   server.send(200, "application/json", json);
 }
 
+// 临时缓存用于接收流式数据
+static const u16 kPanelWidth = 640;
+static const u16 kPanelHeight = 480;
+static const u16 kBytesPerRowPacked = kPanelWidth / 2; // 4bit/像素
+static const u16 kBytesPerRowUnpacked = kPanelWidth;   // 1B/px 低4bit有效
+static u16 g_streamRowStart = 0;
+static u16 g_streamRows = 0;
+static bool g_streamPacked = true;
+static std::unique_ptr<u8[]> g_streamBuf;
+static size_t g_streamExpected = 0;
+static size_t g_streamReceived = 0;
+
+void handleStreamUpload() {
+  HTTPUpload &up = server.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    String qsRow = server.arg("rowStart");
+    String qsRows = server.arg("rows");
+    String qsPacked = server.arg("packed");
+    g_streamRowStart = (u16)(qsRow.length() ? qsRow.toInt() : 0);
+    g_streamRows = (u16)(qsRows.length() ? qsRows.toInt() : 0);
+    g_streamPacked = (qsPacked == "0") ? false : true;
+    if (g_streamRows == 0 || g_streamRowStart >= kPanelHeight) {
+      g_streamRows = 0; // 标记无效
+    }
+    size_t bytesPerRow = g_streamPacked ? kBytesPerRowPacked : kBytesPerRowUnpacked;
+    g_streamExpected = (size_t)bytesPerRow * (size_t)g_streamRows;
+    g_streamReceived = 0;
+    g_streamBuf.reset();
+    if (g_streamExpected > 0) {
+      g_streamBuf.reset(new u8[g_streamExpected]);
+    }
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (g_streamBuf && g_streamReceived < g_streamExpected) {
+      size_t can = std::min((size_t)up.currentSize, g_streamExpected - g_streamReceived);
+      memcpy(g_streamBuf.get() + g_streamReceived, up.buf, can);
+      g_streamReceived += can;
+    }
+  } else if (up.status == UPLOAD_FILE_ABORTED) {
+    g_streamBuf.reset();
+    g_streamExpected = g_streamReceived = 0;
+  }
+}
+
+void handleStreamComplete() {
+  if (!g_streamBuf || g_streamRows == 0) {
+    server.send(400, "text/plain", "invalid stream params");
+    return;
+  }
+  if (g_streamReceived != g_streamExpected) {
+    server.send(400, "text/plain", "incomplete body");
+    g_streamBuf.reset();
+    return;
+  }
+
+  const u16 rowsNow = g_streamRows;
+  // 源行宽/高（可选，用于packed=0缩放）
+  u16 srcWidth = server.hasArg("sw") ? (u16)server.arg("sw").toInt() : kPanelWidth;
+  u16 srcHeight = server.hasArg("sh") ? (u16)server.arg("sh").toInt() : kPanelHeight;
+  if (srcWidth == 0 || srcHeight == 0) { srcWidth = kPanelWidth; srcHeight = kPanelHeight; }
+
+  if (g_streamPacked) {
+    // 要求packed=1时 srcWidth==640
+    u32 lenBytes = (u32)kBytesPerRowPacked * (u32)rowsNow;
+    display_image((u8*)g_streamBuf.get(), lenBytes, 0, g_streamRowStart);
+  } else {
+    std::unique_ptr<u8[]> dst(new u8[(size_t)kBytesPerRowPacked * (size_t)rowsNow]);
+    for (u16 ry = 0; ry < rowsNow; ry++) {
+      u16 ySrc = g_streamRowStart + ry;
+      if (ySrc >= srcHeight) ySrc = srcHeight - 1;
+      const u8* s = g_streamBuf.get() + (size_t)ySrc * (size_t)srcWidth;
+      u8* d = dst.get() + (size_t)ry * (size_t)kBytesPerRowPacked;
+      for (u16 x = 0; x < kPanelWidth; x += 2) {
+        u32 x0 = ((u32)x * (u32)srcWidth) / (u32)kPanelWidth;
+        if (x0 >= srcWidth) x0 = srcWidth - 1;
+        u32 x1 = ((u32)(x + 1) * (u32)srcWidth) / (u32)kPanelWidth;
+        if (x1 >= srcWidth) x1 = srcWidth - 1;
+        u8 v0 = s[x0] & 0x0F;
+        u8 v1 = s[x1] & 0x0F;
+        if (invertEnabled) { v0 = (u8)(0x0F - v0); v1 = (u8)(0x0F - v1); }
+        d[x >> 1] = (u8)((v0 << 4) | v1);
+      }
+    }
+    u32 lenBytes = (u32)kBytesPerRowPacked * (u32)rowsNow;
+    display_image((u8*)dst.get(), lenBytes, 0, g_streamRowStart);
+  }
+
+  g_streamBuf.reset();
+  g_streamExpected = g_streamReceived = 0;
+  server.send(200, "text/plain", "chunk applied");
+}
+
 // FS状态
 void handleFsStatus() {
   String json = "{";
@@ -1222,6 +1319,9 @@ void setupWebServer() {
     }
     server.send(ok ? 200 : 500, "text/plain", ok ? "FS格式化完成" : "FS格式化失败/未挂载");
   });
+
+  // 直连流式端点：/stream-chunk?rowStart=<u16>&rows=<u16>&packed=1
+  server.on("/stream-chunk", HTTP_POST, handleStreamComplete, handleStreamUpload);
 
   
   server.begin();

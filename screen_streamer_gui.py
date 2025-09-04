@@ -143,6 +143,21 @@ class ScreenStreamerGUI:
             g4 = 15 - g4
         return g4.tobytes()
 
+    def _pack_rows_4bit(self, g4_bytes, row_start, rows):
+        """Pack 1B/px low-nibble grayscale to 4-bit per pixel (two pixels per byte) for given rows"""
+        w = 640
+        bytes_per_row_src = w
+        bytes_per_row_dst = w // 2
+        out = np.empty(bytes_per_row_dst * rows, dtype=np.uint8)
+        src = np.frombuffer(g4_bytes, dtype=np.uint8).reshape(480, 640)
+        block = src[row_start:row_start+rows, :]
+        # pack: (p0<<4) | p1
+        hi = block[:, 0::2] & 0x0F
+        lo = block[:, 1::2] & 0x0F
+        packed = ((hi << 4) | lo).astype(np.uint8)
+        out[:] = packed.reshape(-1)
+        return out.tobytes()
+
     def _upload_and_apply(self, host, data_bytes):
         if requests is None:
             raise RuntimeError("requests not installed: pip install requests")
@@ -160,8 +175,21 @@ class ScreenStreamerGUI:
             w = int(self.w_var.get()); h = int(self.h_var.get())
             host = self.host.get().strip()
             img = self._capture_region(x, y, w, h)
-            data = self._to_4bit_bytes(img, invert=self.invert_var.get())
-            self._upload_and_apply(host, data)
+            g4 = self._to_4bit_bytes(img, invert=self.invert_var.get())
+            # stream in chunks of 60 rows via /stream-chunk (packed=1)
+            for row_start in range(0, 480, 60):
+                rows = min(60, 480 - row_start)
+                chunk = self._pack_rows_4bit(g4, row_start, rows)
+                params = {
+                    'rowStart': str(row_start),
+                    'rows': str(rows),
+                    'packed': '1'
+                }
+                files = {'file': ('chunk.bin', chunk, 'application/octet-stream')}
+                if requests is None:
+                    raise RuntimeError("requests not installed: pip install requests")
+                r = requests.post(host.rstrip('/') + "/stream-chunk", params=params, files=files, timeout=10)
+                r.raise_for_status()
         except Exception as e:
             messagebox.showerror("Error", str(e))
             self._log(f"Error: {e}")
