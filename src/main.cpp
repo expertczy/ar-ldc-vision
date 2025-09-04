@@ -134,6 +134,12 @@ WebServer server(80);  // HTTP端口80
 // 图像颜色反转开关（true = 反转）
 bool invertEnabled = false;
 
+// 运行时图像路径与FS状态
+static const char* kRuntimeImagePath = "/current_image.bin"; // 640x480, 1B/px, 低4位有效
+static bool fsMounted = false;
+static File uploadFile;
+static size_t lastUploadedSize = 0;
+
 // 函数声明
 void JBD_init(void);
 void drawLetter(char letter);
@@ -141,6 +147,7 @@ void drawString(const char text[], int len);
 void setTextHorizontalFlip(bool enable);
 void packPngScaledRowsToPanel(u8 *dest, u16 destWidth, u16 destHeight, const u8 *src, u16 srcWidth, u16 srcHeight, u16 rowStart, u16 rows, bool invert);
 void refreshDisplay();
+void refreshDisplayFromFS();
 void setBrightness(u16 brightness);
 void connectToWiFi();
 void setupWebServer();
@@ -155,6 +162,16 @@ void handleGetWiFiStatus();
 void handleInvert();
 void handleDisplayPower();
 void renderGreenCircle(u8 *dest, u16 widthPixels, u16 heightRows, u8 grayLevel);
+
+// 运行时上传/应用/测试/下载/FS状态
+void handleUploadData();
+void handleUploadComplete();
+void handleApply();
+void handleGetRuntimeStatus();
+void handleRuntimeDownload();
+void handleFsStatus();
+uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t len);
+uint32_t computeFileCRC32(File &f);
 
 // 配置引脚
 void JBD_init(void)
@@ -772,6 +789,14 @@ void handleRoot() {
   html += "  }).catch(e => console.log('WiFi status update failed'));";
   html += "}";
   html += "setInterval(updateWiFiStatus, 5000);"; // 每5秒更新WiFi状态
+  // 上传&调试步骤
+  html += "function stepMount(){fetch('/api/fs-status').then(r=>r.json()).then(d=>alert('FS mounted:'+d.mounted+' total:'+d.total+' used:'+d.used)).catch(()=>alert('FS状态接口不可用'));}";
+  html += "function stepRuntimeStatus(){fetch('/api/runtime-status').then(r=>r.json()).then(d=>alert('available:'+d.available+' size:'+d.size)).catch(()=>alert('runtime-status 不可用'));}";
+  html += "function stepUpload(){const f=document.getElementById('rtimg').files[0]; if(!f){alert('请选择 .bin');return;} const fd=new FormData(); fd.append('file', f); fetch('/upload',{method:'POST',body:fd}).then(r=>r.text()).then(t=>alert(t)).catch(e=>alert('上传失败:'+e));}";
+  html += "function stepApply(){fetch('/apply',{method:'POST'}).then(r=>r.text()).then(t=>alert(t)).catch(e=>alert('apply失败:'+e));}";
+  html += "function stepDownload(){window.open('/runtime.bin','_blank');}";
+  html += "function refreshRuntimeCard(){fetch('/api/runtime-status').then(r=>r.json()).then(d=>{document.getElementById('rtinfo').textContent=d.available?('可用, '+d.size+' 字节'):'未找到';});}";
+  html += "function stepFormat(){if(confirm('格式化SPIFFS将清空文件，确定？')){fetch('/api/fs-format',{method:'POST'}).then(r=>r.text()).then(t=>alert(t)).catch(()=>alert('format失败'));}}";
   html += "</script>";
   
   html += "<div class='control'><h3>🔄 显示翻转</h3>";
@@ -779,6 +804,20 @@ void handleRoot() {
   html += "<button class='btn-primary' onclick=\"toggleFlip(true)\">启用水平翻转</button>";
   html += "<button class='btn-danger' onclick=\"toggleFlip(false)\">禁用水平翻转</button>";
   html += "</div>";
+  
+  // 运行时图像 - 调试步骤面板
+  html += "<div class='control'><h3>🧪 上传调试步骤</h3>";
+  html += "<div>运行时文件状态: <span id='rtinfo'>--</span></div>";
+  html += "<div style='margin-top:8px'><input id='rtimg' type='file' accept='.bin'></div>";
+  html += "<div style='margin-top:8px'>";
+  html += "<button class='btn-warning' onclick=\"stepMount()\">1) 检查FS</button>";
+  html += "<button class='btn-warning' onclick=\"stepRuntimeStatus()\">2) 查看状态</button>";
+  html += "<button class='btn-success' onclick=\"stepUpload()\">3) 上传.bin</button>";
+  html += "<button class='btn-primary' onclick=\"stepApply()\">4) 应用图像</button>";
+  html += "<button class='btn-primary' onclick=\"stepDownload()\">5) 下载核对</button>";
+  html += "<button class='btn-warning' onclick=\"refreshRuntimeCard()\">刷新状态</button>";
+  html += "<button class='btn-danger' onclick=\"stepFormat()\">格式化SPIFFS</button>";
+  html += "</div></div>";
   
 
 
@@ -849,6 +888,50 @@ void refreshDisplay() {
     display_image(image, lenBytes, 0, (u16)rowStart);
     rowStart += rowsNow;
   }
+}
+
+// 从SPIFFS读取运行时图像并刷新
+void refreshDisplayFromFS() {
+  if (!fsMounted || !SPIFFS.exists(kRuntimeImagePath)) {
+    refreshDisplay();
+    return;
+  }
+  const u16 panelWidth = 640;
+  const u16 panelHeight = 480;
+  const u16 chunkRows = 40;
+  const u16 srcBytesPerRow = panelWidth; // 1B/px
+  const u16 dstBytesPerRow = panelWidth / 2; // 2px/byte
+
+  File f = SPIFFS.open(kRuntimeImagePath, "r");
+  if (!f) { refreshDisplay(); return; }
+  size_t expected = (size_t)panelWidth * (size_t)panelHeight;
+  if ((size_t)f.size() < expected) { f.close(); refreshDisplay(); return; }
+
+  std::unique_ptr<u8[]> src(new u8[(size_t)srcBytesPerRow * (size_t)chunkRows]);
+  std::unique_ptr<u8[]> dst(new u8[(size_t)dstBytesPerRow * (size_t)chunkRows]);
+
+  u16 rowStart = 0;
+  while (rowStart < panelHeight) {
+    u16 rowsNow = (panelHeight - rowStart) > chunkRows ? chunkRows : (panelHeight - rowStart);
+    size_t offset = (size_t)rowStart * (size_t)srcBytesPerRow;
+    f.seek((u32)offset, SeekSet);
+    size_t toRead = (size_t)srcBytesPerRow * (size_t)rowsNow;
+    size_t n = f.read((uint8_t*)src.get(), toRead);
+    if (n != toRead) break;
+    for (u16 ry = 0; ry < rowsNow; ry++) {
+      const u8* s = src.get() + (size_t)ry * (size_t)srcBytesPerRow;
+      u8* d = dst.get() + (size_t)ry * (size_t)dstBytesPerRow;
+      for (u16 x = 0; x < panelWidth; x += 2) {
+        u8 v0 = s[x] & 0x0F; u8 v1 = s[x+1] & 0x0F;
+        if (invertEnabled) { v0 = (u8)(0x0F - v0); v1 = (u8)(0x0F - v1); }
+        d[x >> 1] = (u8)((v0 << 4) | v1);
+      }
+    }
+    u32 lenBytes = (u32)dstBytesPerRow * (u32)rowsNow;
+    display_image((u8*)dst.get(), lenBytes, 0, (u16)rowStart);
+    rowStart += rowsNow;
+  }
+  f.close();
 }
 
 void handleInvert() {
@@ -937,6 +1020,15 @@ void handleStatus() {
   html += "<span class='label'>💽 Flash Size:</span>";
   html += "<span class='value'>" + String(ESP.getFlashChipSize()) + " bytes</span>";
   html += "</div>";
+  {
+    bool available = fsMounted && SPIFFS.exists(kRuntimeImagePath);
+    size_t sz = 0;
+    if (available) { File tf = SPIFFS.open(kRuntimeImagePath, "r"); if (tf) { sz = tf.size(); tf.close(); } }
+    html += "<div class='status-item'>";
+    html += "<span class='label'>🖼️ Runtime Image:</span>";
+    html += "<span class='value'>" + String(available ? "Available" : "Not found") + (available ? (String(", ") + String(sz) + " bytes") : String("")) + "</span>";
+    html += "</div>";
+  }
   
   html += "<button class='refresh-btn' onclick='window.location.reload()'>🔄 Refresh</button>";
   html += "<button class='refresh-btn' onclick='window.location.href=\"/\"' style='margin-left:10px;background:#28a745;'>🏠 Home</button>";
@@ -983,6 +1075,113 @@ void handleGetWiFiStatus() {
   server.send(200, "application/json", json);
 }
 
+// 上传处理：数据块写入
+void handleUploadData() {
+  HTTPUpload& up = server.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    if (!fsMounted) { Serial.println("/upload: FS未挂载"); return; }
+    if (SPIFFS.exists(kRuntimeImagePath)) SPIFFS.remove(kRuntimeImagePath);
+    uploadFile = SPIFFS.open(kRuntimeImagePath, "w");
+    lastUploadedSize = 0;
+    Serial.printf("/upload: start '%s'\n", up.filename.c_str());
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (uploadFile) {
+      uploadFile.write(up.buf, up.currentSize);
+      lastUploadedSize += up.currentSize;
+    }
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (uploadFile) uploadFile.close();
+    Serial.printf("/upload: end, total=%u bytes\n", (unsigned)lastUploadedSize);
+  } else if (up.status == UPLOAD_FILE_ABORTED) {
+    if (uploadFile) { uploadFile.close(); }
+    if (SPIFFS.exists(kRuntimeImagePath)) { SPIFFS.remove(kRuntimeImagePath); }
+    Serial.println("/upload: aborted");
+  }
+}
+
+// 上传完成后的响应
+void handleUploadComplete() {
+  if (!fsMounted) { server.send(500, "text/plain", "FS未挂载"); return; }
+  if (SPIFFS.exists(kRuntimeImagePath)) {
+    File f = SPIFFS.open(kRuntimeImagePath, "r");
+    size_t sz = f ? f.size() : 0; if (f) f.close();
+    if (sz == 0) server.send(500, "text/plain", "上传失败: 空文件");
+    else server.send(200, "text/plain", String("上传完成, 大小 ") + String(sz) + " 字节");
+  } else {
+    server.send(500, "text/plain", "上传失败");
+  }
+}
+
+// 应用运行时图像
+void handleApply() {
+  if (!fsMounted) { server.send(500, "text/plain", "FS未挂载"); return; }
+  if (!SPIFFS.exists(kRuntimeImagePath)) { server.send(404, "text/plain", "未找到运行时图像"); return; }
+  refreshDisplayFromFS();
+  server.send(200, "text/plain", "已应用运行时图像");
+}
+
+// 下载当前bin
+void handleRuntimeDownload() {
+  if (!fsMounted || !SPIFFS.exists(kRuntimeImagePath)) { server.send(404, "text/plain", "未找到"); return; }
+  File f = SPIFFS.open(kRuntimeImagePath, "r");
+  server.streamFile(f, "application/octet-stream");
+  f.close();
+}
+
+// 运行时文件状态
+void handleGetRuntimeStatus() {
+  bool available = fsMounted && SPIFFS.exists(kRuntimeImagePath);
+  size_t sz = 0;
+  if (available) { File f = SPIFFS.open(kRuntimeImagePath, "r"); if (f) { sz = f.size(); f.close(); } }
+  String json = "{";
+  json += "\"available\": " + String(available ? "true" : "false") + ",";
+  json += "\"size\": " + String(sz);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+// FS状态
+void handleFsStatus() {
+  String json = "{";
+  json += "\"mounted\": "; json += fsMounted ? "true" : "false"; json += ",";
+  if (fsMounted) {
+    size_t total = SPIFFS.totalBytes();
+    size_t used = SPIFFS.usedBytes();
+    json += "\"total\": "; json += String(total); json += ",";
+    json += "\"used\": "; json += String(used);
+  } else {
+    json += "\"total\": 0, \"used\": 0";
+  }
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+// CRC32 计算
+uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t len) {
+  crc = ~crc;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (int j = 0; j < 8; j++) {
+      uint32_t mask = -(crc & 1u);
+      crc = (crc >> 1) ^ (0xEDB88320u & mask);
+    }
+  }
+  return ~crc;
+}
+
+uint32_t computeFileCRC32(File &f) {
+  const size_t BUFSZ = 2048;
+  uint8_t buf[BUFSZ];
+  uint32_t crc = 0;
+  f.seek(0, SeekSet);
+  while (true) {
+    size_t n = f.read(buf, BUFSZ);
+    if (n == 0) break;
+    crc = crc32_update(crc, buf, n);
+  }
+  return crc;
+}
+
 
 
 
@@ -1009,6 +1208,20 @@ void setupWebServer() {
   server.on("/api/flip-status", handleGetFlipStatus);
   server.on("/invert", handleInvert);
   server.on("/api/wifi-status", handleGetWiFiStatus);
+
+  // 运行时图像上传/应用/下载/状态
+  server.on("/upload", HTTP_POST, handleUploadComplete, handleUploadData);
+  server.on("/apply", HTTP_POST, handleApply);
+  server.on("/api/runtime-status", HTTP_GET, handleGetRuntimeStatus);
+  server.on("/runtime.bin", HTTP_GET, handleRuntimeDownload);
+  server.on("/api/fs-status", HTTP_GET, handleFsStatus);
+  server.on("/api/fs-format", HTTP_POST, [](){
+    bool ok = false;
+    if (fsMounted) {
+      ok = SPIFFS.format();
+    }
+    server.send(ok ? 200 : 500, "text/plain", ok ? "FS格式化完成" : "FS格式化失败/未挂载");
+  });
 
   
   server.begin();
@@ -1113,6 +1326,14 @@ void setup()
   Serial.begin(115200);
   Serial.println("AR-Ldc-Vision 初始化中...");
   delay_ms(10);
+  // 挂载SPIFFS
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS 挂载失败");
+    fsMounted = false;
+  } else {
+    fsMounted = true;
+    Serial.println("SPIFFS 已挂载");
+  }
   //u32 ID = read_id();
   //u8 Stus = rd_status_reg(SPI_RD_STATUS_REG2);
   //u16 lum = rd_lum_reg();

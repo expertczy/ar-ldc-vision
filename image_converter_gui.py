@@ -89,7 +89,17 @@ class ImageConverterGUI:
         # Convert button
         convert_btn = ttk.Button(main_frame, text="🚀 Convert Image", 
                                 command=self.convert_image, style='Accent.TButton')
-        convert_btn.grid(row=4, column=0, columnspan=3, pady=20)
+        convert_btn.grid(row=4, column=0, columnspan=2, pady=20, sticky=(tk.W))
+
+        # Export .bin button
+        export_btn = ttk.Button(main_frame, text="💾 Export runtime .bin", 
+                                command=self.export_bin)
+        export_btn.grid(row=4, column=2, pady=20, sticky=(tk.E))
+
+        # Preview converted 4-bit button
+        preview_btn = ttk.Button(main_frame, text="👁 Preview 4-bit image", 
+                                 command=self.preview_converted)
+        preview_btn.grid(row=4, column=1, pady=20)
         
         # Progress bar
         self.progress = ttk.Progressbar(main_frame, mode='indeterminate')
@@ -257,6 +267,90 @@ class ImageConverterGUI:
                     convert_btn.config(state='normal')
                     
         threading.Thread(target=convert_thread, daemon=True).start()
+
+    def preview_converted(self):
+        """Preview the 4-bit converted grayscale as 8-bit image in a popup window"""
+        filepath = self.file_path_var.get().strip()
+        if not filepath:
+            messagebox.showerror("Error", "Please select an image file first!")
+            return
+        try:
+            width = int(self.width_var.get())
+            height = int(self.height_var.get())
+            if width <= 0 or height <= 0:
+                raise ValueError("Dimensions must be positive")
+        except Exception as e:
+            messagebox.showerror("Error", f"Invalid width/height: {e}")
+            return
+
+        try:
+            img = Image.open(filepath)
+            if img.mode != 'L':
+                img = img.convert('L')
+            img = img.resize((width, height), Image.Resampling.LANCZOS)
+            arr = np.array(img)
+            arr4 = np.round(arr / 17.0).astype(np.uint8)
+            arr4 = np.clip(arr4, 0, 15)
+            arr8 = (arr4 * 17).astype(np.uint8)
+            preview = Image.fromarray(arr8, mode='L')
+
+            # show in a popup window
+            win = tk.Toplevel(self.root)
+            win.title("4-bit Converted Preview")
+            canvas = tk.Canvas(win, width=width, height=height)
+            canvas.pack()
+            try:
+                import PIL.ImageTk
+                photo = PIL.ImageTk.PhotoImage(preview)
+                canvas.create_image(0, 0, anchor=tk.NW, image=photo)
+                canvas.image = photo
+            except ImportError:
+                # fallback: save temp and notify
+                tmp_path = os.path.join(os.getcwd(), "preview_converted.png")
+                preview.save(tmp_path)
+                ttk.Label(win, text=f"Preview saved to {tmp_path}").pack()
+        except Exception as e:
+            messagebox.showerror("Error", f"Preview failed: {e}")
+
+    def export_bin(self):
+        """Export 1B/px grayscale .bin for runtime upload (low 4 bits used)"""
+        filepath = self.file_path_var.get().strip()
+        if not filepath:
+            messagebox.showerror("Error", "Please select an image file first!")
+            return
+        try:
+            width = int(self.width_var.get())
+            height = int(self.height_var.get())
+            if width <= 0 or height <= 0:
+                raise ValueError("Dimensions must be positive")
+        except Exception as e:
+            messagebox.showerror("Error", f"Invalid width/height: {e}")
+            return
+
+        try:
+            img = Image.open(filepath)
+            if img.mode != 'L':
+                img = img.convert('L')
+            img = img.resize((width, height), Image.Resampling.LANCZOS)
+            arr = np.array(img)
+            arr4 = np.round(arr / 17.0).astype(np.uint8)
+            arr4 = np.clip(arr4, 0, 15)
+            # store 1 byte per pixel with low 4 bits used
+            arr1 = arr4.astype(np.uint8)
+            out_path = filedialog.asksaveasfilename(
+                title="Save runtime image",
+                defaultextension=".bin",
+                filetypes=[("Binary", "*.bin"), ("All files", "*.*")],
+                initialfile="current_image.bin"
+            )
+            if not out_path:
+                return
+            with open(out_path, 'wb') as f:
+                f.write(arr1.tobytes())
+            self.log(f"✅ Exported runtime bin: {out_path} ({arr1.size} bytes)")
+            messagebox.showinfo("Success", f"Exported runtime .bin:\n{out_path}\n{width}x{height} ({arr1.size} bytes)")
+        except Exception as e:
+            messagebox.showerror("Error", f"Export failed: {e}")
         
     def convert_png_to_fixed_header(self, png_path, target_width=640, target_height=480):
         """Convert PNG image to fixed C++ header file current_image.h"""
