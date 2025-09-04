@@ -14,6 +14,7 @@ from tkinter import ttk, messagebox
 
 import numpy as np
 from PIL import Image
+import struct
 
 try:
     import mss  # fast screen capture
@@ -25,6 +26,12 @@ try:
 except ImportError:
     requests = None
 
+try:
+    import websockets
+    import asyncio
+except ImportError:
+    websockets = None
+    asyncio = None
 
 class ScreenStreamerGUI:
     def __init__(self, root):
@@ -35,12 +42,13 @@ class ScreenStreamerGUI:
         self.running = False
         self.capture_interval = 1.0  # seconds
         self.fps_var = tk.StringVar(value="1")
-        self.host = tk.StringVar(value="http://192.168.1.189/")
+        self.host = tk.StringVar(value="192.168.1.189")
         self.x_var = tk.StringVar(value="0")
         self.y_var = tk.StringVar(value="0")
         self.w_var = tk.StringVar(value="640")
         self.h_var = tk.StringVar(value="480")
         self.invert_var = tk.BooleanVar(value=False)
+        self.ws_rows_var = tk.StringVar(value="10")  # rows per WS chunk (smaller avoids 1009)
 
         self._build_ui()
 
@@ -49,8 +57,8 @@ class ScreenStreamerGUI:
         frame.pack(fill=tk.BOTH, expand=True)
 
         # Connection
-        ttk.Label(frame, text="Device Host (http://ip)").grid(row=0, column=0, sticky=tk.W)
-        host_entry = ttk.Entry(frame, textvariable=self.host, width=30, state='disabled')
+        ttk.Label(frame, text="Device Host (IP)").grid(row=0, column=0, sticky=tk.W)
+        host_entry = ttk.Entry(frame, textvariable=self.host, width=30)
         host_entry.grid(row=0, column=1, sticky=tk.W)
 
         # Region
@@ -72,13 +80,15 @@ class ScreenStreamerGUI:
         ttk.Label(options, text="FPS").grid(row=0, column=1, padx=(12,4), sticky=tk.W)
         ttk.Entry(options, textvariable=self.fps_var, width=6).grid(row=0, column=2, sticky=tk.W)
         ttk.Button(options, text="Pick Start (click on screen)", command=self.pick_start_point).grid(row=0, column=3, padx=(12,0))
+        ttk.Label(options, text="WS rows/chunk").grid(row=0, column=4, padx=(12,4), sticky=tk.W)
+        ttk.Entry(options, textvariable=self.ws_rows_var, width=6).grid(row=0, column=5, sticky=tk.W)
 
         # Controls
         controls = ttk.Frame(frame)
         controls.grid(row=3, column=0, columnspan=2, pady=(10, 5), sticky=(tk.W, tk.E))
         ttk.Button(controls, text="Start", command=self.start).grid(row=0, column=0, padx=5)
         ttk.Button(controls, text="Stop", command=self.stop).grid(row=0, column=1, padx=5)
-        ttk.Button(controls, text="One Shot", command=self.one_shot).grid(row=0, column=2, padx=5)
+        ttk.Button(controls, text="One Shot (WS)", command=self.one_shot_ws).grid(row=0, column=2, padx=5)
         ttk.Button(controls, text="Test Connect", command=self.test_connect).grid(row=0, column=3, padx=5)
 
         # Log
@@ -169,11 +179,42 @@ class ScreenStreamerGUI:
         r2.raise_for_status()
         self._log(f"Apply: {r2.text.strip()}")
 
+    def _ws_send_frame(self, host_ip, g4_bytes):
+        if websockets is None or asyncio is None:
+            raise RuntimeError("websockets not installed: pip install websockets")
+
+        async def _run():
+            uri = f"ws://{host_ip}:81/"
+            async with websockets.connect(uri, max_size=None, ping_interval=None) as ws:
+                # 以每60行一个块发送（与设备端一致），每块前加4字节小端头: rowStart(u16), rows(u16)
+                try:
+                    chunk_rows = int(self.ws_rows_var.get())
+                except Exception:
+                    chunk_rows = 10
+                if chunk_rows <= 0 or chunk_rows > 60:
+                    chunk_rows = 10
+                for row_start in range(0, 480, chunk_rows):
+                    rows = min(chunk_rows, 480 - row_start)
+                    chunk = self._pack_rows_4bit(g4_bytes, row_start, rows)
+                    header = struct.pack('<HH', row_start, rows)
+                    await ws.send(header + chunk)
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(_run())
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+
     def one_shot(self):
         try:
             x = int(self.x_var.get()); y = int(self.y_var.get())
             w = int(self.w_var.get()); h = int(self.h_var.get())
             host = self.host.get().strip()
+            if not host.startswith("http"):
+                host = "http://" + host
             img = self._capture_region(x, y, w, h)
             g4 = self._to_4bit_bytes(img, invert=self.invert_var.get())
             # stream in chunks of 60 rows via /stream-chunk (packed=1)
@@ -194,11 +235,25 @@ class ScreenStreamerGUI:
             messagebox.showerror("Error", str(e))
             self._log(f"Error: {e}")
 
+    def one_shot_ws(self):
+        try:
+            x = int(self.x_var.get()); y = int(self.y_var.get())
+            w = int(self.w_var.get()); h = int(self.h_var.get())
+            host_ip = self.host.get().strip()
+            img = self._capture_region(x, y, w, h)
+            g4 = self._to_4bit_bytes(img, invert=self.invert_var.get())
+            self._ws_send_frame(host_ip, g4)
+            self._log("One shot via WebSocket done")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+            self._log(f"WS Error: {e}")
+
     def _loop(self):
         while self.running:
             t0 = time.time()
             try:
-                self.one_shot()
+                # Prefer WebSocket streaming for performance
+                self.one_shot_ws()
             except Exception as e:
                 self._log(f"Loop error: {e}")
             # update interval from FPS
@@ -229,6 +284,8 @@ class ScreenStreamerGUI:
             if requests is None:
                 raise RuntimeError("requests not installed: pip install requests")
             host = self.host.get().strip().rstrip('/')
+            if not host.startswith("http"):
+                host = "http://" + host
             r = requests.get(host + "/api/fs-status", timeout=5)
             self._log(f"fs-status: {r.status_code} {r.text[:120]}")
             r2 = requests.get(host + "/api/runtime-status", timeout=5)

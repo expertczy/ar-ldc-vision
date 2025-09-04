@@ -6,6 +6,7 @@
 #include <string.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <WebSocketsServer.h>
 #include <FS.h>
 #include <SPIFFS.h>
 #include "../current_image.h"
@@ -130,6 +131,7 @@ u16 currentBrightness = 800;
 const char* wifi_ssid = "Hyperoptic Fibre 93B3";
 const char* wifi_password = "pebdriAnU3347Y";
 WebServer server(80);  // HTTP端口80
+WebSocketsServer wsServer(81); // WebSocket端口81
 
 // 图像颜色反转开关（true = 反转）
 bool invertEnabled = false;
@@ -176,6 +178,7 @@ void handleRuntimeDownload();
 void handleFsStatus();
 uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t len);
 uint32_t computeFileCRC32(File &f);
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
 
 // 配置引脚
 void JBD_init(void)
@@ -1237,6 +1240,25 @@ void handleStreamComplete() {
   server.send(200, "text/plain", "chunk applied");
 }
 
+// WebSocket事件处理：接收二进制块：前4字节为小端头 rowStart(u16), rows(u16)，随后为打包数据(rows * 320字节)
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  if (type == WStype_BIN) {
+    if (length < 4) return;
+    u16 rowStart = (u16)(payload[0] | ((u16)payload[1] << 8));
+    u16 rows = (u16)(payload[2] | ((u16)payload[3] << 8));
+    size_t expected = (size_t)kBytesPerRowPacked * (size_t)rows;
+    if (rowStart >= kPanelHeight || rows == 0) return;
+    if (length < 4 + expected) return;
+    u8 *data = (u8*)(payload + 4);
+    display_image(data, (u32)expected, 0, rowStart);
+  } else if (type == WStype_CONNECTED) {
+    // 可选：连接建立时打印日志
+    Serial.println("WebSocket connected");
+  } else if (type == WStype_DISCONNECTED) {
+    Serial.println("WebSocket disconnected");
+  }
+}
+
 // FS状态
 void handleFsStatus() {
   String json = "{";
@@ -1328,6 +1350,13 @@ void setupWebServer() {
   Serial.println("Web服务器启动成功!");
   Serial.print("访问地址: http://");
   Serial.println(WiFi.localIP());
+
+  // 启动WebSocket服务器
+  wsServer.begin();
+  wsServer.onEvent(webSocketEvent);
+  Serial.print("WebSocket: ws://");
+  Serial.print(WiFi.localIP());
+  Serial.println(":81");
 }
 
 // 生成带透明背景的绿色圆形到帧缓冲（4bit灰度，每字节两个像素）
@@ -1481,6 +1510,8 @@ void loop()
 {
   // 处理Web服务器请求
   server.handleClient();
+  // 处理WebSocket事件
+  wsServer.loop();
 
   // display_image(image, image_len);
 
